@@ -128,6 +128,35 @@ def test_streaming_group_by_types() -> None:
         )
 
 
+def test_streaming_group_by_multi_column_unique_29904() -> None:
+    df = pl.DataFrame(
+        {
+            "group": [0, 0, 0, 1, 1],
+            "a": [1, 1, 2, 3, 3],
+            "b": [4, 5, 4, 6, 6],
+        }
+    )
+
+    for agg, expected in [
+        (
+            pl.col(["a", "b"]).unique(),
+            {"group": [0, 1], "a": [[1, 2], [3]], "b": [[4, 5], [6]]},
+        ),
+        (
+            pl.col(["a", "b"]).n_unique(),
+            {"group": [0, 1], "a": [2, 1], "b": [2, 1]},
+        ),
+    ]:
+        q = df.lazy().group_by("group").agg(agg)
+        graph = q.show_graph(raw_output=True, show=False, engine="streaming")
+        assert graph.count('label="group-by') == 1
+
+        out = q.collect(engine="streaming").sort("group")
+        if out.schema["a"] == pl.List(pl.Int64):
+            out = out.with_columns(pl.col(["a", "b"]).list.sort())
+        assert out.to_dict(as_series=False) == expected
+
+
 def test_streaming_group_by_min_max() -> None:
     df = pl.DataFrame(
         {

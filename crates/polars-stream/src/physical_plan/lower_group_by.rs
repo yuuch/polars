@@ -226,6 +226,24 @@ fn replace_elementwise_components(
     }
 }
 
+fn build_list_unique_expr(input: Node, expr_arena: &mut Arena<AExpr>) -> Node {
+    let implode = expr_arena.add(AExpr::Agg(IRAggExpr::Implode {
+        input,
+        maintain_order: false,
+    }));
+    let element = expr_arena.add(AExpr::Element);
+    let unique = expr_arena.add(AExpr::Function {
+        input: vec![ExprIR::from_node(element, expr_arena)],
+        function: IRFunctionExpr::Unique(false),
+        options: IRFunctionExpr::Unique(false).function_options(),
+    });
+    expr_arena.add(AExpr::Eval {
+        expr: implode,
+        evaluation: unique,
+        variant: EvalVariant::List,
+    })
+}
+
 /// Tries to lower an expression as a 'elementwise scalar agg expression'.
 ///
 /// Such an expression is defined as the elementwise combination of scalar
@@ -294,7 +312,7 @@ fn try_lower_elementwise_scalar_agg_expr(
 
     match expr_arena.get(expr) {
         // Should be handled separately in `Eval`.
-        AExpr::Element => unreachable!(),
+        AExpr::Element => Some(expr),
 
         AExpr::StructField(_) => {
             // Reflecting StructEval expr state is not yet supported.
@@ -405,6 +423,30 @@ fn try_lower_elementwise_scalar_agg_expr(
                 truthy,
                 falsy,
             }))
+        },
+
+        // A non-stable unique aggregation can be implemented by first collecting the values into
+        // one list per group and then deduplicating each list. This keeps multiple unique
+        // aggregations in the same group-by instead of creating one nested group-by per input.
+        AExpr::Function {
+            input,
+            function: IRFunctionExpr::Unique(false),
+            options: _,
+        } if matches!(gbl_kind, GroupByLowerKind::Groups)
+            && !matches!(expr_arena.get(input[0].node()), AExpr::Element) =>
+        {
+            let input = input[0].node();
+            let eval = build_list_unique_expr(input, expr_arena);
+            lower_rec!(eval)
+        },
+
+        // `pl.element().unique()` is the elementwise part of the rewrite above.
+        AExpr::Function {
+            input,
+            function: IRFunctionExpr::Unique(false),
+            options: _,
+        } if input.len() == 1 && matches!(expr_arena.get(input[0].node()), AExpr::Element) => {
+            Some(expr)
         },
 
         #[cfg(feature = "bitwise")]
@@ -567,6 +609,34 @@ fn try_lower_elementwise_scalar_agg_expr(
             }))
         },
 
+        AExpr::Agg(IRAggExpr::Implode {
+            input: unique,
+            maintain_order: false,
+        }) if matches!(gbl_kind, GroupByLowerKind::Groups)
+            && matches!(
+                expr_arena.get(*unique),
+                AExpr::Function {
+                    function: IRFunctionExpr::Unique(false),
+                    ..
+                }
+            ) =>
+        {
+            let unique_input = match expr_arena.get(*unique) {
+                AExpr::Function { input, .. } => input[0].node(),
+                _ => unreachable!(),
+            };
+            let eval = build_list_unique_expr(unique_input, expr_arena);
+            lower_rec!(eval)
+        },
+        AExpr::Agg(IRAggExpr::NUnique(input)) if matches!(gbl_kind, GroupByLowerKind::Groups) => {
+            let eval = build_list_unique_expr(*input, expr_arena);
+            let length = expr_arena.add(AExpr::Function {
+                input: vec![ExprIR::from_node(eval, expr_arena)],
+                function: IRFunctionExpr::ListExpr(IRListFunction::Length),
+                options: IRFunctionExpr::ListExpr(IRListFunction::Length).function_options(),
+            });
+            lower_rec!(length)
+        },
         AExpr::Agg(agg) => {
             match agg {
                 IRAggExpr::Min { .. }
